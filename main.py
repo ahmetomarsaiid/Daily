@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 import aiohttp
+import re
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
@@ -16,14 +17,19 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = os.environ.get("ADMIN_ID")
 
+# --- BOT MEMORY ---
+# This keeps track of video IDs we have already recommended to avoid repeats!
+SHOWN_VIDEOS = set()
+
 # --- DAILYMOTION API HELPER ---
-async def search_dailymotion(query: str, sort_by: str = 'relevance', limit: int = 5) -> list:
+async def search_dailymotion(query: str, sort_by: str = 'relevance', limit: int = 40) -> list:
     """
-    Connects to the Dailymotion API to fetch videos based on the query.
+    Connects to the Dailymotion API to fetch videos.
+    We fetch a larger limit (40) so we have plenty to filter through!
     """
     url = "https://api.dailymotion.com/videos"
     params = {
-        "fields": "title,url,duration,views_total,thumbnail_360_url",
+        "fields": "id,title,url,duration,views_total",
         "search": query,
         "sort": sort_by,
         "limit": limit
@@ -42,17 +48,56 @@ async def search_dailymotion(query: str, sort_by: str = 'relevance', limit: int 
             logger.error(f"Connection Error: {e}")
             return []
 
+# --- SMART FILTERING SYSTEM ---
+def filter_videos(videos: list, check_history: bool = False, max_results: int = 5) -> list:
+    """
+    Filters out unwanted languages, duplicates, and previously seen videos.
+    """
+    filtered = []
+    seen_title_prefixes = set()
+    
+    for vid in videos:
+        vid_id = vid.get('id')
+        title = vid.get('title', '').lower()
+        
+        # 1. BLOCK UNWANTED LANGUAGES
+        unwanted_words = ['hindi', 'urdu', 'tamil', 'indo', 'espanol', 'spanish']
+        if any(word in title for word in unwanted_words):
+            continue
+            
+        # 2. CHECK HISTORY (Don't show the same recommendation twice)
+        if check_history and vid_id in SHOWN_VIDEOS:
+            continue
+            
+        # 3. BLOCK SAME MOVIE MULTIPLE TIMES
+        # We take the first 3 words of the title to check if we already added this movie
+        # (e.g., "Battle Through The Heavens Part 1" vs "Battle Through The Heavens Part 2")
+        words = tuple(re.sub(r'[^a-z0-9\s]', '', title).split()[:3])
+        if words in seen_title_prefixes:
+            continue
+            
+        # If it passes all tests, add it to our final list!
+        seen_title_prefixes.add(words)
+        filtered.append(vid)
+        
+        # Save to memory if this is a recommendation
+        if check_history:
+            SHOWN_VIDEOS.add(vid_id)
+            
+        # Stop once we have the exact amount requested
+        if len(filtered) >= max_results:
+            break
+            
+    return filtered
+
 # --- REAL-TIME PROGRESS ANIMATION ---
 async def update_search_progress(message, context):
-    """
-    Provides real-time feedback to the user by editing the message 
-    with different search statuses.
-    """
+    """Provides real-time feedback to the user by editing the message."""
     statuses = [
         "â³ <i>Initializing secure connection...</i>",
         "ð¡ <i>Querying Dailymotion servers...</i>",
-        "ð <i>Scanning for requested content...</i>",
-        "ð¥ <i>Extracting and formatting video links...</i>"
+        "ð <i>Filtering out Hindi dubs & duplicates...</i>",
+        "ð¥ <i>Extracting final video links...</i>"
     ]
     
     for status in statuses:
@@ -63,15 +108,15 @@ async def update_search_progress(message, context):
                 text=status,
                 parse_mode=ParseMode.HTML
             )
-            await asyncio.sleep(0.7) # Slight delay to show the animation
+            await asyncio.sleep(0.7) 
         except Exception:
-            pass # Ignore if message hasn't changed
+            pass 
 
 # --- FORMATTING RESULTS ---
 def format_results(videos: list, header: str) -> str:
     """Formats the JSON response into a beautiful Telegram message."""
     if not videos:
-        return f"ð« <b>{header}</b>\n\n<i>No results found for your request. Try different keywords!</i>"
+        return f"ð« <b>{header}</b>\n\n<i>No results found after filtering out duplicates and unwanted languages. Try a different search!</i>"
     
     text = f"â¨ <b>{header}</b> â¨\n\n"
     for i, vid in enumerate(videos, 1):
@@ -90,7 +135,7 @@ def format_results(videos: list, header: str) -> str:
 # --- SECURITY CHECK ---
 def is_admin(user_id: int) -> bool:
     """Checks if the user is the authorized admin."""
-    if not ADMIN_ID: # If no admin ID is set in Railway, allow everyone
+    if not ADMIN_ID: 
         return True
     return str(user_id) == str(ADMIN_ID)
 
@@ -104,15 +149,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_text = (
         "ð <b>Welcome to your Personal Cinema Bot!</b>\n\n"
-        "I am ready to fetch the best Chinese dubbed dramas and movies for you.\n\n"
+        "I am ready to fetch the best Chinese dramas dubbed in English for you.\n\n"
         "ð <b>Select an option below or type a command:</b>\n"
-        "ð¹ <code>/dubbed [name]</code> - Search Chinese dubbed videos\n"
+        "ð¹ <code>/dubbed [name]</code> - Search Chinese English dubbed videos\n"
         "ð¹ <code>/search [query]</code> - Get top 5 popular general results\n"
-        "ð¹ <code>/recommend</code> - Get latest Chinese dubbed martial arts/superpower"
+        "ð¹ <code>/recommend</code> - Get fresh Chinese English dubbed recommendations"
     )
     
     keyboard = [
-        [InlineKeyboardButton("ð Get Recommendations", callback_data="btn_recommend")],
+        [InlineKeyboardButton("ð Get Fresh Recommendations", callback_data="btn_recommend")],
         [
             InlineKeyboardButton("ð¬ How to use Dubbed", callback_data="btn_help_dubbed"),
             InlineKeyboardButton("ð How to Search", callback_data="btn_help_search")
@@ -123,7 +168,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text=welcome_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
 
 async def dubbed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Searches specifically for Chinese dubbed content."""
+    """Searches specifically for Chinese English dubbed content."""
     if not is_admin(update.effective_user.id):
         return
 
@@ -132,20 +177,17 @@ async def dubbed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("â ï¸ <b>Error:</b> Please provide a movie name!\n<i>Example:</i> <code>/dubbed the legend of shen li</code>", parse_mode=ParseMode.HTML)
         return
 
-    # Create the specific search phrase
-    search_query = f"{query_raw} chinese dubbed"
+    # Create the specific search phrase, forcefully excluding hindi
+    search_query = f"{query_raw} english dubbed chinese drama -hindi"
     
-    # Send initial message to edit later
     status_msg = await update.message.reply_text("ð <i>Starting search engine...</i>", parse_mode=ParseMode.HTML)
-    
-    # Show real-time progress
     await update_search_progress(status_msg, context)
     
-    # Fetch data
-    videos = await search_dailymotion(search_query, sort_by='relevance', limit=5)
+    # Fetch data and apply our smart filter (don't check history for direct searches)
+    raw_videos = await search_dailymotion(search_query, sort_by='relevance', limit=40)
+    videos = filter_videos(raw_videos, check_history=False)
     
-    # Format and send final results
-    final_text = format_results(videos, f"Chinese Dubbed Results for '{query_raw}'")
+    final_text = format_results(videos, f"Chinese (Eng Dub) Results for '{query_raw}'")
     await status_msg.edit_text(text=final_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -161,44 +203,52 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("ð <i>Starting search engine...</i>", parse_mode=ParseMode.HTML)
     await update_search_progress(status_msg, context)
     
-    # Fetch data sorting by 'visited' (most popular)
-    videos = await search_dailymotion(query_raw, sort_by='visited', limit=5)
+    # General search, basic filter to avoid same title duplicates
+    raw_videos = await search_dailymotion(query_raw, sort_by='visited', limit=30)
+    videos = filter_videos(raw_videos, check_history=False)
     
     final_text = format_results(videos, f"Top Popular Results for '{query_raw}'")
     await status_msg.edit_text(text=final_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 async def recommend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fetches the latest Chinese dubbed martial arts/superpower content."""
+    """Fetches unique, fresh Chinese English dubbed recommendations."""
     if not is_admin(update.effective_user.id):
         return
 
-    status_msg = await update.message.reply_text("ð <i>Curating recommendations...</i>", parse_mode=ParseMode.HTML)
+    status_msg = await update.message.reply_text("ð <i>Curating fresh recommendations...</i>", parse_mode=ParseMode.HTML)
     await update_search_progress(status_msg, context)
     
-    # Specific query for recommendations, sorted by newest
-    search_query = "chinese dubbed martial arts OR chinese dubbed superpower OR chinese dubbed fantasy"
-    videos = await search_dailymotion(search_query, sort_by='recent', limit=5)
+    # Broad query for Chinese dramas, excluding Hindi
+    search_query = "chinese drama english dubbed martial arts OR chinese english dubbed fantasy -hindi"
     
-    final_text = format_results(videos, "ð¥ Latest Dubbed Martial Arts/Superpower Picks ð¥")
+    raw_videos = await search_dailymotion(search_query, sort_by='recent', limit=50)
+    
+    # Apply strict filter: No repeats, No Hindi, check against bot memory (history)
+    videos = filter_videos(raw_videos, check_history=True)
+    
+    final_text = format_results(videos, "ð¥ Fresh Chinese (Eng Dub) Picks ð¥")
     await status_msg.edit_text(text=final_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
-# --- CALLBACK QUERY HANDLER (For inline buttons) ---
+# --- CALLBACK QUERY HANDLER ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles button clicks from the inline keyboard menu."""
     query = update.callback_query
-    await query.answer() # Acknowledge button click
+    await query.answer() 
     
     if query.data == "btn_recommend":
-        # We reuse the logic from the recommend command
-        status_msg = await query.message.reply_text("ð <i>Curating recommendations...</i>", parse_mode=ParseMode.HTML)
+        # Re-trigger the recommend logic
+        status_msg = await query.message.reply_text("ð <i>Curating fresh recommendations...</i>", parse_mode=ParseMode.HTML)
         await update_search_progress(status_msg, context)
-        search_query = "chinese dubbed martial arts OR chinese dubbed superpower OR chinese dubbed fantasy"
-        videos = await search_dailymotion(search_query, sort_by='recent', limit=5)
-        final_text = format_results(videos, "ð¥ Latest Dubbed Picks ð¥")
+        
+        search_query = "chinese drama english dubbed martial arts OR chinese english dubbed fantasy -hindi"
+        raw_videos = await search_dailymotion(search_query, sort_by='recent', limit=50)
+        videos = filter_videos(raw_videos, check_history=True)
+        
+        final_text = format_results(videos, "ð¥ Fresh Chinese (Eng Dub) Picks ð¥")
         await status_msg.edit_text(text=final_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         
     elif query.data == "btn_help_dubbed":
-        await query.message.reply_text("ð¡ <b>To find a Chinese dubbed show:</b>\nJust type <code>/dubbed</code> followed by the title.\n\n<i>Example:</i> <code>/dubbed Battle Through The Heavens</code>", parse_mode=ParseMode.HTML)
+        await query.message.reply_text("ð¡ <b>To find a Chinese English dubbed show:</b>\nJust type <code>/dubbed</code> followed by the title.\n\n<i>Example:</i> <code>/dubbed Battle Through The Heavens</code>", parse_mode=ParseMode.HTML)
         
     elif query.data == "btn_help_search":
         await query.message.reply_text("ð¡ <b>To do a general search:</b>\nJust type <code>/search</code> followed by whatever you want. I will fetch the 5 most viewed videos.\n\n<i>Example:</i> <code>/search music video</code>", parse_mode=ParseMode.HTML)
